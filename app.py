@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 import json
 import requests
 from zoneinfo import ZoneInfo
@@ -217,6 +217,11 @@ try:
     from tomorrow_forecast_engine import build_tomorrow_forecast
 except Exception:
     build_tomorrow_forecast = None
+
+try:
+    from future_eyes import FutureEyes
+except Exception:
+    FutureEyes = None
 
 # =========================================================
 # HELPERS
@@ -1809,6 +1814,171 @@ def fetch_ohlcv(
 
     except Exception:
         return pd.DataFrame()
+
+
+# =========================================================
+# TIME MACHINE — HISTORICAL 10-MINUTE REPLAY
+# =========================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_time_machine_data(symbol, replay_date):
+    """Load historical 10-minute candles and isolate one trading date."""
+
+    if symbol not in SPOT_TOKENS:
+        return pd.DataFrame()
+
+    try:
+        target = replay_date if isinstance(replay_date, date) else date.fromisoformat(str(replay_date))
+
+        # Angel historical API is requested for a window and then filtered locally.
+        # Keep a 30-day window so the selected recent session can be replayed.
+        days = max(5, min(30, (date.today() - target).days + 5))
+
+        raw = telemetry.fetch_ohlcv(
+            exchange=SPOT_TOKENS[symbol][0],
+            token=SPOT_TOKENS[symbol][1],
+            interval="TEN_MINUTE",
+            days=days,
+        ) if telemetry is not None else pd.DataFrame()
+
+        df = clean_df(raw)
+        if df.empty:
+            return pd.DataFrame()
+
+        rename = {}
+        for c in df.columns:
+            lc = str(c).lower()
+            if lc in ["open", "o"]:
+                rename[c] = "open"
+            elif lc in ["high", "h"]:
+                rename[c] = "high"
+            elif lc in ["low", "l"]:
+                rename[c] = "low"
+            elif lc in ["close", "c", "ltp"]:
+                rename[c] = "close"
+            elif lc in ["volume", "vol"]:
+                rename[c] = "volume"
+            elif lc in ["datetime", "timestamp", "time", "date"]:
+                rename[c] = "timestamp"
+
+        df = df.rename(columns=rename)
+
+        if "timestamp" not in df.columns:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index().rename(columns={df.index.name or "index": "timestamp"})
+            else:
+                return pd.DataFrame()
+
+        for c in ["open", "high", "low", "close"]:
+            if c not in df.columns:
+                return pd.DataFrame()
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+        ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        if ts.isna().all():
+            ts = pd.to_datetime(df["timestamp"], errors="coerce")
+
+        # Convert to IST for date/time replay.
+        try:
+            if getattr(ts.dt, "tz", None) is None:
+                ts = ts.dt.tz_localize(IST)
+            else:
+                ts = ts.dt.tz_convert(IST)
+        except Exception:
+            return pd.DataFrame()
+
+        df["timestamp"] = ts
+        df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+        df = df[df["timestamp"].dt.date == target].copy()
+        df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+
+        if df.empty:
+            return df
+
+        return add_indicators(df)
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def time_machine_snapshot(df, candle_index):
+    """Return only candles visible at the selected replay point."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    try:
+        idx = max(0, min(int(candle_index), len(df) - 1))
+        return df.iloc[:idx + 1].copy()
+    except Exception:
+        return pd.DataFrame()
+
+
+def time_machine_signal(snapshot):
+    """Technical-only replay signal. No future candles are used."""
+    result = {
+        "signal": "WAIT",
+        "trend": "UNKNOWN",
+        "rsi": None,
+        "adx": None,
+        "ema20": None,
+        "ema50": None,
+        "vwap": None,
+        "support": None,
+        "resistance": None,
+        "score": 0,
+    }
+
+    if snapshot is None or snapshot.empty:
+        return result
+
+    row = snapshot.iloc[-1]
+    last = num(row.get("close"))
+    ema20 = num(row.get("EMA20"))
+    ema50 = num(row.get("EMA50"))
+    rsi = num(row.get("RSI"))
+    adx = num(row.get("ADX"))
+    vwap = num(row.get("VWAP"))
+
+    score = 0
+    if last is not None and ema20 is not None:
+        score += 1 if last > ema20 else -1
+    if ema20 is not None and ema50 is not None:
+        score += 1 if ema20 > ema50 else -1
+    if rsi is not None:
+        if rsi >= 55:
+            score += 1
+        elif rsi <= 45:
+            score -= 1
+    if vwap is not None and last is not None:
+        score += 1 if last > vwap else -1
+
+    if score >= 3:
+        signal, trend = "BUY BIAS", "BULLISH"
+    elif score <= -3:
+        signal, trend = "SELL BIAS", "BEARISH"
+    else:
+        signal, trend = "WAIT", "SIDEWAYS / MIXED"
+
+    recent = snapshot.tail(min(20, len(snapshot)))
+    support = num(recent["low"].min()) if "low" in recent.columns else None
+    resistance = num(recent["high"].max()) if "high" in recent.columns else None
+
+    result.update({
+        "signal": signal,
+        "trend": trend,
+        "rsi": rsi,
+        "adx": adx,
+        "ema20": ema20,
+        "ema50": ema50,
+        "vwap": vwap,
+        "support": support,
+        "resistance": resistance,
+        "score": score,
+    })
+    return result
 
 # =========================================================
 # INDICATORS
@@ -4548,6 +4718,137 @@ if not chain.empty:
             hide_index=True
         )
 
+
+# =========================================================
+# TIME MACHINE UI
+# =========================================================
+
+st.divider()
+st.subheader("📼 Time Machine — 10 Minute Market Replay")
+st.caption(
+    "Historical replay only. Har step par analysis sirf us waqt tak ki candles use karta hai; "
+    "future candles signal calculation mein include nahi hoti."
+)
+
+_tm_today = date.today()
+_tm_default = _tm_today - timedelta(days=1)
+if _tm_default.weekday() >= 5:
+    _tm_default = _tm_today - timedelta(days=2)
+
+_tm_date = st.date_input(
+    "Replay Date",
+    value=_tm_default,
+    min_value=_tm_today - timedelta(days=30),
+    max_value=_tm_today,
+    key="tm_date",
+)
+
+_tm_col1, _tm_col2 = st.columns(2)
+with _tm_col1:
+    tm_symbol = st.selectbox(
+        "Replay Market",
+        UNDERLYINGS,
+        index=UNDERLYINGS.index(underlying) if underlying in UNDERLYINGS else 0,
+        key="tm_symbol",
+    )
+with _tm_col2:
+    tm_interval = st.selectbox(
+        "Replay Interval",
+        ["10 Minutes"],
+        key="tm_interval",
+    )
+
+if st.button("📥 Load Historical Session", use_container_width=True, key="tm_load"):
+    st.session_state["tm_loaded"] = True
+    st.session_state["tm_index"] = 0
+
+if st.session_state.get("tm_loaded", False):
+    tm_df = load_time_machine_data(tm_symbol, _tm_date)
+
+    if tm_df.empty:
+        st.warning(
+            "Is date ke liye 10-minute historical candle data available nahi mila. "
+            "Weekend/holiday ya broker historical-data limitation ho sakti hai."
+        )
+        st.session_state["tm_loaded"] = False
+    else:
+        tm_max = len(tm_df) - 1
+        tm_index = int(st.session_state.get("tm_index", 0))
+        tm_index = max(0, min(tm_index, tm_max))
+
+        tm_index = st.slider(
+            "Replay Position",
+            min_value=0,
+            max_value=tm_max,
+            value=tm_index,
+            step=1,
+            format="%d",
+            key="tm_slider",
+        )
+        st.session_state["tm_index"] = tm_index
+
+        tm_left, tm_mid, tm_right = st.columns(3)
+        with tm_left:
+            if st.button("◀ Previous 10 Min", use_container_width=True, key="tm_prev"):
+                st.session_state["tm_index"] = max(0, tm_index - 1)
+                st.rerun()
+        with tm_mid:
+            if st.button("▶ Next 10 Min", type="primary", use_container_width=True, key="tm_next"):
+                st.session_state["tm_index"] = min(tm_max, tm_index + 1)
+                st.rerun()
+        with tm_right:
+            if st.button("⏮ Start", use_container_width=True, key="tm_start"):
+                st.session_state["tm_index"] = 0
+                st.rerun()
+
+        tm_snapshot = time_machine_snapshot(tm_df, tm_index)
+        tm_row = tm_snapshot.iloc[-1]
+        tm_sig = time_machine_signal(tm_snapshot)
+        tm_time = tm_row["timestamp"].strftime("%H:%M")
+
+        st.success(f"Replay time: {tm_time} • Candle {tm_index + 1}/{len(tm_df)}")
+
+        t1, t2, t3, t4 = st.columns(4)
+        with t1:
+            st.metric("Price", fmt(tm_row.get("close")))
+        with t2:
+            st.metric("Signal", tm_sig["signal"])
+        with t3:
+            st.metric("Trend", tm_sig["trend"])
+        with t4:
+            st.metric("Score", f"{tm_sig['score']:+d}")
+
+        i1, i2, i3, i4 = st.columns(4)
+        with i1:
+            st.metric("RSI", fmt(tm_sig["rsi"]))
+        with i2:
+            st.metric("ADX", fmt(tm_sig["adx"]))
+        with i3:
+            st.metric("EMA20", fmt(tm_sig["ema20"]))
+        with i4:
+            st.metric("EMA50", fmt(tm_sig["ema50"]))
+
+        st.caption(
+            f"VWAP: {fmt(tm_sig['vwap'])} • "
+            f"Support: {fmt(tm_sig['support'])} • "
+            f"Resistance: {fmt(tm_sig['resistance'])}"
+        )
+
+        visible_cols = [
+            "timestamp", "open", "high", "low", "close", "volume",
+            "EMA20", "EMA50", "RSI", "ADX", "VWAP"
+        ]
+        visible_cols = [c for c in visible_cols if c in tm_snapshot.columns]
+        tm_view = tm_snapshot[visible_cols].tail(12).copy()
+        if "timestamp" in tm_view.columns:
+            tm_view["timestamp"] = tm_view["timestamp"].dt.strftime("%H:%M")
+
+        st.dataframe(
+            tm_view,
+            use_container_width=True,
+            hide_index=True,
+        )
+
 # =========================================================
 # TRADE IDEAS
 # =========================================================
@@ -4981,6 +5282,198 @@ if st.button(
                 "technical analysis, options aur "
                 "institutional input par based hain."
             )
+
+# =========================================================
+# FUTURE EYES — HISTORICAL DECISION / ACTUAL VALIDATION
+# =========================================================
+
+st.divider()
+st.subheader("👁️ Future Eyes — Decision vs Actual")
+st.caption(
+    "Historical research only. Decision ke waqt sirf visible candles use hoti hain. "
+    "Future candle ko signal banane se pehle kabhi use nahi kiya jata; "
+    "future candle sirf baad mein validation ke liye use hoti hai."
+)
+
+if FutureEyes is None:
+    st.warning("future_eyes.py load nahi hua. Future Eyes module unavailable hai.")
+else:
+    _fe_today = date.today()
+    _fe_default = _fe_today - timedelta(days=1)
+    if _fe_default.weekday() >= 5:
+        _fe_default = _fe_today - timedelta(days=2)
+
+    fe_date = st.date_input(
+        "Future Eyes Replay Date",
+        value=_fe_default,
+        min_value=_fe_today - timedelta(days=30),
+        max_value=_fe_today,
+        key="fe_date",
+    )
+
+    fe_c1, fe_c2 = st.columns(2)
+    with fe_c1:
+        fe_symbol = st.selectbox(
+            "Future Eyes Market",
+            UNDERLYINGS,
+            index=UNDERLYINGS.index(underlying) if underlying in UNDERLYINGS else 0,
+            key="fe_symbol",
+        )
+    with fe_c2:
+        fe_horizon = st.selectbox(
+            "Validation Horizon",
+            [1, 2, 3],
+            index=0,
+            format_func=lambda x: f"Next {x} candle(s)",
+            key="fe_horizon",
+        )
+
+    if st.button("👁️ Load Future Eyes", type="primary", use_container_width=True, key="fe_load"):
+        st.session_state["fe_loaded"] = True
+        st.session_state["fe_index"] = 0
+
+    if st.session_state.get("fe_loaded", False):
+        try:
+            _fe_engine = FutureEyes(fetch_ohlcv=fetch_ohlcv, interval="TEN_MINUTE")
+            _fe_df = _fe_engine.load_session(fe_symbol, fe_date, days=30)
+
+            if _fe_df.empty:
+                st.warning(
+                    "Selected date ke liye Future Eyes historical data available nahi mila. "
+                    "Weekend/holiday ya broker historical-data limitation ho sakti hai."
+                )
+                st.session_state["fe_loaded"] = False
+            else:
+                _fe_max = len(_fe_df) - 1
+                _fe_idx = int(st.session_state.get("fe_index", 0))
+                _fe_idx = max(0, min(_fe_idx, _fe_max))
+
+                _fe_idx = st.slider(
+                    "Decision Checkpoint",
+                    min_value=0,
+                    max_value=_fe_max,
+                    value=_fe_idx,
+                    step=1,
+                    key="fe_slider",
+                )
+                st.session_state["fe_index"] = _fe_idx
+
+                _fe_point = _fe_engine.point(_fe_df, _fe_idx)
+                _fe_visible = _fe_point.visible.copy()
+                _fe_visible = add_indicators(_fe_visible)
+                _fe_signal = time_machine_signal(_fe_visible)
+
+                # Build a paper-trade idea from ONLY the visible snapshot.
+                _fe_idea = None
+                _fe_price = num(_fe_visible.iloc[-1].get("close"))
+                if _fe_signal["signal"] == "BUY BIAS" and _fe_price is not None:
+                    _fe_sl = _fe_signal["support"]
+                    if _fe_sl is None or _fe_sl >= _fe_price:
+                        _fe_sl = _fe_price * 0.997
+                    _fe_risk = _fe_price - _fe_sl
+                    if _fe_risk > 0:
+                        _fe_idea = {
+                            "action": "BUY",
+                            "entry": _fe_price,
+                            "sl": _fe_sl,
+                            "target1": _fe_price + _fe_risk * 1.5,
+                            "target2": _fe_price + _fe_risk * 2.5,
+                        }
+                elif _fe_signal["signal"] == "SELL BIAS" and _fe_price is not None:
+                    _fe_sl = _fe_signal["resistance"]
+                    if _fe_sl is None or _fe_sl <= _fe_price:
+                        _fe_sl = _fe_price * 1.003
+                    _fe_risk = _fe_sl - _fe_price
+                    if _fe_risk > 0:
+                        _fe_idea = {
+                            "action": "SELL",
+                            "entry": _fe_price,
+                            "sl": _fe_sl,
+                            "target1": _fe_price - _fe_risk * 1.5,
+                            "target2": _fe_price - _fe_risk * 2.5,
+                        }
+
+                _fe_result = _fe_engine.evaluate(
+                    _fe_point,
+                    _fe_idea,
+                    horizon_bars=int(fe_horizon),
+                )
+
+                _fe_time = _fe_point.timestamp.strftime("%H:%M")
+                st.success(
+                    f"Decision checkpoint: {_fe_time} • "
+                    f"Visible candles: {len(_fe_point.visible)} • "
+                    f"Future candles hidden from decision: {len(_fe_point.future)}"
+                )
+
+                f1, f2, f3, f4 = st.columns(4)
+                with f1:
+                    st.metric("Visible Price", fmt(_fe_price))
+                with f2:
+                    st.metric("Decision", _fe_signal["signal"])
+                with f3:
+                    st.metric("Trend", _fe_signal["trend"])
+                with f4:
+                    st.metric("Score", f"{_fe_signal['score']:+d}")
+
+                f5, f6, f7, f8 = st.columns(4)
+                with f5:
+                    st.metric("RSI", fmt(_fe_signal["rsi"]))
+                with f6:
+                    st.metric("ADX", fmt(_fe_signal["adx"]))
+                with f7:
+                    st.metric("EMA20", fmt(_fe_signal["ema20"]))
+                with f8:
+                    st.metric("EMA50", fmt(_fe_signal["ema50"]))
+
+                st.markdown("### 🔒 Decision Snapshot")
+                if _fe_idea:
+                    d1, d2, d3, d4 = st.columns(4)
+                    with d1:
+                        st.metric("Action", _fe_idea["action"])
+                    with d2:
+                        st.metric("Entry", fmt(_fe_idea["entry"]))
+                    with d3:
+                        st.metric("SL", fmt(_fe_idea["sl"]))
+                    with d4:
+                        st.metric("Target 1", fmt(_fe_idea["target1"]))
+                else:
+                    st.info("Is checkpoint par sufficiently strong BUY/SELL setup nahi tha — NO TRADE.")
+
+                st.markdown("### ✅ Actual Future Validation")
+                v1, v2, v3, v4 = st.columns(4)
+                with v1:
+                    st.metric("Result", _fe_result.get("result") or "NO TRADE")
+                with v2:
+                    st.metric("Status", _fe_result.get("status", "NO TRADE"))
+                with v3:
+                    st.metric("Bars Checked", _fe_result.get("bars_checked", 0))
+                with v4:
+                    st.metric("Exit", fmt(_fe_result.get("exit")))
+
+                st.write(
+                    f"**Validation reason:** {_fe_result.get('reason', '-') }"
+                )
+
+                _fe_visible_cols = [
+                    "timestamp", "open", "high", "low", "close", "volume",
+                    "EMA20", "EMA50", "RSI", "ADX", "VWAP"
+                ]
+                _fe_visible_cols = [c for c in _fe_visible_cols if c in _fe_visible.columns]
+                _fe_view = _fe_visible[_fe_visible_cols].tail(12).copy()
+                if "timestamp" in _fe_view.columns:
+                    _fe_view["timestamp"] = _fe_view["timestamp"].dt.strftime("%H:%M")
+
+                st.markdown("### 📊 Data Used For Decision")
+                st.dataframe(_fe_view, use_container_width=True, hide_index=True)
+
+                st.caption(
+                    "Rule: visible candles → decision → future candles → validation. "
+                    "Future candle data is never passed into the decision snapshot."
+                )
+
+        except Exception as _fe_error:
+            st.error(f"Future Eyes error: {_fe_error}")
 
 # =========================================================
 # STATUS
