@@ -5307,7 +5307,7 @@ else:
         "Future Eyes Replay Date",
         value=_fe_default,
         min_value=_fe_today - timedelta(days=30),
-        max_value=_fe_today,
+        max_value=_fe_today + timedelta(days=7),
         key="fe_date",
     )
 
